@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <httplib.h>
 #include "wrapped_server.h"
+#include "model_residency.h"
 #include "model_manager.h"
 #include "backend_manager.h"
 #include "runtime_config.h"
@@ -72,7 +73,8 @@ public:
                     RecipeOptions options,
                     bool do_not_upgrade = true,
                     bool allow_reload_on_option_change = false,
-                    std::optional<bool> pinned = std::nullopt);
+                    std::optional<bool> pinned = std::nullopt,
+                    LoadPurpose load_purpose = LoadPurpose::UserInference);
 
     void unload_model(const std::string& model_name = "");  // Empty = unload all
 
@@ -178,9 +180,10 @@ private:
     void prune_unavailable_servers_locked();
     bool reload_model_after_watchdog_reset(const std::string& requested_model, const RecipeOptions& options);
     bool is_watchdog_reset_response(const json& response) const;
-    int count_servers_by_type(ModelType type) const;
+    int count_servers_in_pool(ModelType type, ResidencyClass residency_class) const;
     int count_pinned_servers_by_type(ModelType type) const;
-    WrappedServer* find_lru_server_by_type(ModelType type) const;
+    WrappedServer* find_lru_server_in_pool(ModelType type, ResidencyClass residency_class) const;
+    void ensure_residency_capacity(ModelType type, ResidencyClass residency_class);
     bool has_npu_server() const;
     WrappedServer* find_npu_server() const;
     WrappedServer* find_npu_server_by_recipe(const std::string& recipe) const;

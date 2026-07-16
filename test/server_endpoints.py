@@ -3233,10 +3233,10 @@ class EndpointTests(ServerTestBase):
         chat adapter, reasoning suppression, structured-reply parsing, and model
         loading against a real backend, not FakeClassifierServices.
 
-        Note: under the default max_loaded_models=1 the router LLM and the
-        selected candidate share the single generation slot, so consecutive
-        requests reload both models. Slot semantics for classifier models are
-        deliberately out of scope here and tracked in #2725."""
+        Regression coverage for #2725: under the default
+        max_loaded_models=1, the router LLM occupies routing_helper/llm while the
+        selected candidate occupies standard/llm. Two consecutive requests must
+        keep both backend PIDs stable."""
         router_model = ENDPOINT_TEST_MODEL
         candidate_model = SECOND_TEST_MODEL_EVICTION
         pull_model_with_retry(router_model)
@@ -3327,9 +3327,133 @@ class EndpointTests(ServerTestBase):
                 rationale.strip(),
                 "llm router rationale must be a non-empty string",
             )
+            health = requests.get(
+                f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT
+            ).json()
+            self.assertEqual(
+                health.get("max_models", {}).get("llm"),
+                1,
+                "this regression test must exercise the default standard LLM limit",
+            )
+            loaded = {
+                item.get("model_name"): item
+                for item in health.get("all_models_loaded", [])
+            }
+            self.assertIn(router_model, loaded, loaded)
+            self.assertIn(candidate_model, loaded, loaded)
+            self.assertEqual(
+                loaded[router_model].get("residency_class"), "routing_helper"
+            )
+            self.assertEqual(
+                loaded[router_model].get("slot_pool"), "routing_helper/llm"
+            )
+            self.assertEqual(
+                loaded[candidate_model].get("residency_class"), "standard"
+            )
+            self.assertEqual(
+                loaded[candidate_model].get("slot_pool"), "standard/llm"
+            )
+            first_pids = {
+                router_model: int(loaded[router_model]["pid"]),
+                candidate_model: int(loaded[candidate_model]["pid"]),
+            }
+
+            second_response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": public_name,
+                    "messages": [
+                        {"role": "user", "content": "Explain gradient descent again."}
+                    ],
+                    "max_tokens": 16,
+                    "route_trace": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(
+                second_response.status_code, 200, second_response.text
+            )
+            second_body = second_response.json()
+            self.assertNotIn("error", second_body, second_body)
+            self.assertEqual(
+                second_body.get("x_lemonade_route", {}).get("route_to"),
+                candidate_model,
+            )
+
+            health_after = requests.get(
+                f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT
+            ).json()
+            loaded_after = {
+                item.get("model_name"): item
+                for item in health_after.get("all_models_loaded", [])
+            }
+            self.assertIn(router_model, loaded_after, loaded_after)
+            self.assertIn(candidate_model, loaded_after, loaded_after)
+            self.assertEqual(
+                int(loaded_after[router_model]["pid"]),
+                first_pids[router_model],
+                "router backend must stay warm across routed requests",
+            )
+            self.assertEqual(
+                int(loaded_after[candidate_model]["pid"]),
+                first_pids[candidate_model],
+                "candidate backend must stay warm across routed requests",
+            )
+
+            # Pinning is local to the standard pool. Remove only the helper,
+            # then prove it can be loaded again without the pinned candidate
+            # causing SlotsPinnedException or being evicted.
+            pin_response = requests.post(
+                f"{self.base_url.replace('/api/v1', '')}/internal/pin",
+                json={"model_name": candidate_model, "pinned": True},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(pin_response.status_code, 200, pin_response.text)
+            unload_router = requests.post(
+                f"{self.base_url}/unload",
+                json={"model_name": router_model},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(unload_router.status_code, 200, unload_router.text)
+
+            pinned_response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": public_name,
+                    "messages": [
+                        {"role": "user", "content": "Explain gradient descent briefly."}
+                    ],
+                    "max_tokens": 16,
+                    "route_trace": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(
+                pinned_response.status_code, 200, pinned_response.text
+            )
+            pinned_health = requests.get(
+                f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT
+            ).json()
+            pinned_loaded = {
+                item.get("model_name"): item
+                for item in pinned_health.get("all_models_loaded", [])
+            }
+            self.assertIn(router_model, pinned_loaded, pinned_loaded)
+            self.assertIn(candidate_model, pinned_loaded, pinned_loaded)
+            self.assertTrue(pinned_loaded[candidate_model].get("pinned"))
+            self.assertEqual(
+                int(pinned_loaded[candidate_model]["pid"]),
+                first_pids[candidate_model],
+                "loading the helper must not evict a pinned standard candidate",
+            )
+            self.assertEqual(
+                pinned_loaded[router_model].get("slot_pool"),
+                "routing_helper/llm",
+            )
+
             print(
-                "[OK] L0a live: structured choice routed through "
-                "Router::chat_completion with label + rationale in the trace"
+                "[OK] L0a live: stable router/candidate PIDs and pool-local "
+                "pinning at max_loaded_models=1"
             )
         finally:
             for body in (

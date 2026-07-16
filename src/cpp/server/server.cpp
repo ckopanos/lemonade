@@ -181,7 +181,8 @@ void set_route_decision_sse_content_provider(
 }
 
 int get_http_status_from_error(const std::string& error_code) {
-    if (error_code == "slots_pinned_error") {
+    if (error_code == "slots_pinned_error" ||
+        error_code == "router_residency_conflict") {
         return 409;
     } else if (error_code == "model_load_error") {
         return 500;
@@ -1783,7 +1784,18 @@ nlohmann::json Server::create_model_error(const std::string& requested_model, co
         return error_response;
     }
 
-    // Case 3: Model exists and is available, but failed to load (engine error or pinned slots constraint)
+    // Case 3: Model exists and is available, but failed to load.
+    if (exception_msg.rfind("Routing residency conflict:", 0) == 0) {
+        error_response["error"] = {
+            {"message", exception_msg},
+            {"type", "router_residency_conflict"},
+            {"param", "model"},
+            {"code", "router_residency_conflict"},
+            {"requested_model", requested_model}
+        };
+        return error_response;
+    }
+
     if (exception_msg.find("are pinned") != std::string::npos) {
         error_response["error"] = {
             {"message", exception_msg},
@@ -1843,9 +1855,13 @@ nlohmann::json Server::extract_auto_load_options(const json& request) {
 
 void Server::auto_load_model_if_needed(
     const std::string& requested_model,
-    const json& request_options) {
-    // Check if this specific model is already loaded (multi-model aware)
-    if (router_->is_model_loaded(requested_model)) {
+    const json& request_options,
+    LoadPurpose load_purpose) {
+    // Standard requests keep the fast no-op path. Routing dependencies still
+    // enter Router::load_model when already live so a standard process can be
+    // promoted to routing_helper residency without a reload.
+    if (load_purpose == LoadPurpose::UserInference &&
+        router_->is_model_loaded(requested_model)) {
         LOG(DEBUG, "Server") << "Model already loaded: " << requested_model << std::endl;
         if (request_options.contains("ctx_size")) {
             auto loaded_ctx = router_->get_model_recipe_options(requested_model)
@@ -1898,7 +1914,11 @@ void Server::auto_load_model_if_needed(
     // Load model with do_not_upgrade=true, applying per-request options on first load.
     // For FLM models: FastFlowLMServer will handle download internally if needed
     // For non-FLM models: Model should already be cached at this point
-    router_->load_model(requested_model, info, RecipeOptions(info.recipe, request_options), true);
+    router_->load_model(requested_model, info,
+                        RecipeOptions(info.recipe, request_options), true,
+                        /*allow_reload_on_option_change=*/false,
+                        /*pinned=*/std::nullopt,
+                        load_purpose);
     LOG(INFO, "Server") << "Model loaded successfully: " << requested_model << std::endl;
 }
 
@@ -2309,7 +2329,10 @@ std::optional<RouterDispatchResult> Server::route_collection_request(
     // immutable policy into it.
     RoutePolicy policy = *collection_info.route_policy;
     ClassifierServices services = make_router_classifier_services(
-        *router_, [this](const std::string& m) { auto_load_model_if_needed(m); });
+        *router_, [this](const std::string& m) {
+            auto_load_model_if_needed(m, json::object(),
+                                      LoadPurpose::RoutingDependency);
+        });
     RoutingPolicyEngine engine(std::move(policy), std::move(services));
 
     RouteContext ctx = build_route_context(request_json, collection_info.model_name);
